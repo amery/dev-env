@@ -1,0 +1,155 @@
+# Depot CI — devcontainer scenario testing for dev-env.
+#
+# Grown one rung at a time (see NEXT.md "## CI"). Each rung exercises the real
+# generate -> build -> up flow on a Depot runner, proving the host-adaptive
+# init scripts work from a fresh checkout. Iterate without pushing:
+#
+#   depot ci run --workflow .depot/workflows/devcontainer.yml
+#
+# depot ci run uploads uncommitted changes as a patch, so a dirty working tree
+# is included in the run — keep docker/Dockerfile clean before running.
+#
+# GitHub Actions syntax; Depot CI executes it on managed runners.
+name: devcontainer
+
+on:
+  # Build every push except work-in-progress branches, plus every pull
+  # request. The per-job `if` guard drops the redundant same-repo PR run.
+  push:
+    branches-ignore:
+      - '**-wip'
+  pull_request:
+  # depot ci run drives on-demand iteration from a feature branch — Depot only
+  # registers the push/pull_request triggers once the workflow is on the
+  # default branch — so keep an explicit manual trigger too.
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Rung 2 — generate, then build, from a fresh checkout.
+    #
+    # A clean checkout carries the committed devcontainer.json but not the
+    # gitignored .devcontainer/Dockerfile. `devcontainer build` does not run
+    # initializeCommand (only `up`/`create` do), so init.js must run first to
+    # write the Dockerfile and merge the overlay.
+    runs-on: depot-ubuntu-24.04
+    # A same-repo pull request was already built by its push event; only run the
+    # pull_request build when it comes from a different repository (a fork).
+    if: (github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository)
+    env:
+      # Point npm/npx at the mounted cache disk so the devcontainer CLI (and the
+      # resolved npx tree) persist across runs, independent of $HOME.
+      NPM_CONFIG_CACHE: /mnt/npm-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate devcontainer files
+        run: node .devcontainer/init.js
+
+      # Persist the npm store (the @devcontainers/cli download and resolved npx
+      # tree) on a durable Depot CI cache disk. Unlike actions/cache, cache-mount
+      # is keyed by an org-global name, not a branch/tag ref, so it works under
+      # ref-less `depot ci run`; write-lock lets this job populate the disk.
+      - name: Mount npm cache disk
+        uses: depot/cache-mount@v1
+        with:
+          name: dev-env-npm-cache
+          path: /mnt/npm-cache
+          write-lock: /mnt/npm-cache
+          debug: true
+
+      # Caching signal: a cold disk is empty here, a warm one already holds the
+      # CLI — so the size printed before the build should jump between passes.
+      - name: Report npm cache before build
+        run: du -sh /mnt/npm-cache
+
+      # Pinned to the CLI version verified locally (0.87.0).
+      - name: Build devcontainer image
+        run: npx -y @devcontainers/cli@0.87.0 build --workspace-folder .
+
+      - name: Report npm cache after build
+        run: du -sh /mnt/npm-cache
+
+      # Rung 3 — start the container. Unlike build, `up` runs initializeCommand
+      # itself (init.js -> init.sh), so it re-generates the files and then
+      # brings the container up: the first rung to exercise the bind mounts
+      # (.claude, .claude.json, cache home, gnupg-absent) and the privileged
+      # runArgs (cap-adds, unconfined apparmor/seccomp) on a Depot runner.
+      - name: Start devcontainer
+        run: npx -y @devcontainers/cli@0.87.0 up --workspace-folder .
+
+      # Rung 4 — exec a probe inside the started container. The probe lives in
+      # the workspace, so it is only reachable here if the workspace bind
+      # resolved; it then verifies the container user, the entrypoint's
+      # environment, and the host-config binds from within.
+      - name: Probe inside container
+        run: npx -y @devcontainers/cli@0.87.0 exec --workspace-folder . sh .devcontainer/probe.sh
+
+  devcontainer-json:
+    # Rung 6 (scenario axis B) — devcontainer.json present / missing / empty.
+    # The merged guard is init.sh:270 `[ -s "$F" ] || die "devcontainer.json
+    # not found or empty."`, so `-s` fails for both a missing and an empty file
+    # (there is no template path). A present file must let init succeed; a
+    # missing or empty one must die *via that guard*, not some unrelated crash.
+    # Each case declares its expected outcome and the assert step enforces it.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: present
+            expect: success
+          - case: missing
+            expect: die
+          - case: empty
+            expect: die
+    runs-on: depot-ubuntu-24.04
+    # A same-repo pull request was already built by its push event; only run the
+    # pull_request build when it comes from a different repository (a fork).
+    if: (github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up the ${{ matrix.case }} devcontainer.json
+        run: |
+          F=.devcontainer/devcontainer.json
+          case "${{ matrix.case }}" in
+            present) ;;            # committed file, already in generated form
+            missing) rm -f "$F" ;;
+            empty)   : > "$F" ;;
+          esac
+
+      - name: Assert init ${{ matrix.expect }} on a ${{ matrix.case }} file
+        run: |
+          set +e
+          err=$(node .devcontainer/init.js 2>&1)
+          code=$?
+          set -e
+          echo "$err"
+          case "${{ matrix.expect }}" in
+            success)
+              if [ "$code" -ne 0 ]; then
+                echo "FAIL: init.js exited $code, expected success"
+                exit 1
+              fi
+              echo "PASS: init.js succeeded on a present devcontainer.json" ;;
+            die)
+              if [ "$code" -eq 0 ]; then
+                echo "FAIL: init.js exited 0, expected a guard die"
+                exit 1
+              fi
+              case "$err" in
+                *"devcontainer.json not found or empty"*)
+                  echo "PASS: init.js died via the guard (exit $code)" ;;
+                *)
+                  echo "FAIL: init.js exited $code but not via the guard"
+                  exit 1 ;;
+              esac ;;
+          esac
